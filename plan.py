@@ -17,7 +17,7 @@ parser.add_argument('--loadpath', type=str, default='logs')
 parser.add_argument('--dataset', type=str, default='halfcheetah-medium-v2')
 parser.add_argument('--model_path', type=str, default='base')
 parser.add_argument('--model_epoch', type=int, default=0)
-parser.add_argument('--device', type=str, default='cuda')
+parser.add_argument('--device', type=str, default='cpu')
 parser.add_argument('--num_eval', type=int, default=10)
 
 parser.add_argument('--plan_freq', type=int, default=1)
@@ -57,8 +57,8 @@ print(f'Dataset [{args.dataset}] / Model : [{args.model_path}/model_{args.model_
 discretizer = torch.load(os.path.join(loadpath, "discretizer.pt"), map_location=args.device)
 
 mconf = dill.load(open(loadpath + '/model_config.dill', 'rb'))
-# set_seed(mconf.seed)
-set_seed(args.seed)
+mconf.dataset = args.dataset
+set_seed(mconf.seed)
 
 model = GPT(mconf)
 # model.load_state_dict(torch.load(loadpath + '/models/state_'+ str(args.model_epoch) +'.pt'))
@@ -67,7 +67,8 @@ model.to(torch.device(args.device))
 
 env = load_environment(args.dataset)
 
-s_dim = mconf.obs_dim
+# s_dim = mconf.obs_dim
+s_dim = 8*5
 a_dim = mconf.action_dim
 mconf.discount = 0.99
 timer = Timer()

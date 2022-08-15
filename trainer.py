@@ -2,7 +2,7 @@ import math
 import torch
 from torch_geometric.loader import DataLoader
 # from torch.utils.data import DataLoader
-from utils import Timer
+from utils import Timer, to
 
 class Trainer:
     def __init__(self, **kwargs):
@@ -19,23 +19,21 @@ class Trainer:
         return self.optimizer
 
     def model_parr(self, model):
-        if torch.cuda.is_available():
+        if self.device != 'cpu' and torch.cuda.is_available():
             self.device = torch.cuda.current_device()
-            self.model = torch.nn.DataParallel(model).to(self.device)
+            self.model = torch.nn.DataParallel(model).cuda()
         else:
             self.device = 'cpu'
             self.model = model
 
     def train(self, model, dataset, n_epochs=1, log_freq=100):
-        # self.model_parr(model)
-        # model = self.model
-
+        self.model_parr(model)
+        model = self.model
         raw_model = model.module if hasattr(model, "module") else model
         optimizer = self.get_optimizer(raw_model)
-        # optimizer = self.get_optimizer(model)
 
         model.train(True)
-        vocab_size = dataset.N
+        vocab_size = dataset.vocab_size
 
         loader = DataLoader(dataset, shuffle=True, pin_memory=True,
                             batch_size=self.batch_size,
@@ -45,9 +43,9 @@ class Trainer:
             losses = []
             timer = Timer()
             for it, batch in enumerate(loader):
-                batch.to(self.device)
+                batch = to(batch, self.device)
                 with torch.set_grad_enabled(True):
-                    logits, loss, y = model(batch)
+                    logits, loss = model(*batch)
                     loss = loss.mean()
                     losses.append(loss.item())
 
@@ -58,6 +56,7 @@ class Trainer:
 
                 # decay the learning rate based on our progress
                 if self.lr_decay:
+                    y = batch[-2]
                     self.n_tokens += (y != vocab_size).sum() # number of tokens processed this step
                     if self.n_tokens < self.warmup_tokens:
                         # linear warmup

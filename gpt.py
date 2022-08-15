@@ -26,10 +26,11 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
         ## mask previous value estimates
-        joined_dim = config.obs_dim + config.action_dim + 2
-        self.mask.squeeze()[:,joined_dim-1::joined_dim] = 0
-        ##
+        self.mask.squeeze()[:, config.total_dim-1::config.total_dim] = 0
         self.n_head = config.n_head
+        self.n_vt = config.num_virtual_tokens
+        self.n_node = config.num_node
+        self.f_dim = config.node_feature_dim
 
     def forward(self, x, attn_bias=None, layer_past=None):
         B, T, C = x.shape
@@ -42,9 +43,19 @@ class CausalSelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         ## [ B x n_heads x T x T ]
-        if attn_bias is None:
-            attn_bias = torch.zeros((B, self.n_head, T, T), device=x.device)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) + attn_bias
+        padded_attn_bias = torch.zeros((B, self.n_head, T, T), device=x.device).contiguous()
+
+        if attn_bias is not None:
+            # (nh, N+1, N+1)
+            nh, n = attn_bias.size()[:2]
+            attn_bias = torch.repeat_interleave(attn_bias, self.f_dim)
+            attn_bias = attn_bias.view(nh, -1, n*self.f_dim)
+            attn_bias = attn_bias.repeat(1, 1, self.f_dim)
+            attn_bias = attn_bias.view(nh, n*self.f_dim, n*self.f_dim)
+            nh, d = attn_bias.size()[:2]
+            padded_attn_bias[:, :nh, :d, :d] =  attn_bias
+
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) + padded_attn_bias
         att = att.masked_fill(self.mask[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         self._attn_map = att.clone()
@@ -131,7 +142,7 @@ class GPT(nn.Module):
         # input embedding stem (+1 for stop token)
         self.grp_encoder = GraphormerEncoder(config)
         self.tok_emb = nn.Embedding(
-            config.vocab_size * config.trans_dim + 1, config.n_embd
+            config.vocab_size * (config.arV_dim + config.num_node) + 1, config.n_embd
         )
 
         self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
@@ -141,24 +152,27 @@ class GPT(nn.Module):
         # decoder head
         self.ln_f = nn.LayerNorm(config.n_embd)
         # self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.head = EinLinear(config.trans_dim, config.n_embd, config.vocab_size + 1, bias=False)
+        self.head = EinLinear(config.total_dim, config.n_embd, config.vocab_size + 1, bias=False)
+
+        self.embd_dim = config.n_embd
+        self.n_head = config.n_head
+        self.apply(self._init_weights)
 
         self.vocab_size = config.vocab_size
-        self.stop_token = config.vocab_size * config.trans_dim
+        self.stop_token = config.vocab_size * config.total_dim
         self.block_size = config.block_size
-
-        self.observation_dim = config.obs_dim
-        self.action_dim = config.action_dim
-        self.transition_dim = config.trans_dim
-        self.node_feature_dim = config.node_feature_dim
         
         self.action_weight = config.action_weight
         self.reward_weight = config.reward_weight
         self.value_weight = config.value_weight
 
-        self.embd_dim = config.n_embd
-        self.n_head = config.n_head
-        self.apply(self._init_weights)
+        self.action_dim = config.action_dim
+        self.total_trans_dim = config.total_dim
+        self.num_virtual_tokens = config.num_virtual_tokens
+        self.num_node = config.num_node
+        self.node_feature_dim = config.node_feature_dim
+        self.graph_attr = config.graph_attr
+        
 
     def get_block_size(self):
         return self.block_size
@@ -218,109 +232,96 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    # def offset_tokens(self, idx):
-    #     _, t = idx.shape
-    #     n_states = int(np.ceil(t / self.transition_dim))
-    #     offsets = torch.arange(self.transition_dim) * self.vocab_size
-    #     offsets = offsets.repeat(n_states).to(idx.device)
-    #     offset_idx = idx + offsets[:t]
-    #     offset_idx[idx == self.vocab_size] = self.stop_token
-    #     return offset_idx
+    def state_offset(self, x):
+        bs, n, f = x.size()
+        state_offsets = torch.arange(n) * self.vocab_size
+        state_offsets = state_offsets[None, :, None]
+        state_offsets = state_offsets.repeat(bs, 1, f).to(x.device)
+        offset_x = x + state_offsets
+        return offset_x
 
-    def offset_tokens(self, idx, s=0):
-        _, t = idx.shape
-        # n_states = int(np.ceil(t / self.transition_dim))
-        offsets = torch.arange(t, device=idx.device) * self.vocab_size + s
-        # offsets = offsets.repeat(n_states).to(idx.device)
-        offset_idx = idx + offsets[:t]
-        offset_idx[idx == self.vocab_size] = self.stop_token
-        return offset_idx
+    def arV_offset(self, y):
+        bs, d = y.size()
+        trans_dim = self.num_node + d
+        stop_token = trans_dim * self.vocab_size
+        arV_offsets = torch.arange(self.num_node, trans_dim) * self.vocab_size
+        arV_offsets = arV_offsets[None, :].repeat(bs, 1).to(y.device)
+        offset_y = y + arV_offsets
+        offset_y[y == self.vocab_size] = stop_token
+        return offset_y
 
     def pad_to_full_observation(self, x, verify=False):
         b, t, _ = x.shape
-        n_pad = (self.transition_dim - t % self.transition_dim) % self.transition_dim
+        n_pad = (self.total_trans_dim - t % self.total_trans_dim) % self.total_trans_dim
         padding = torch.zeros(b, n_pad, self.embd_dim, device=x.device)
         ## [ B x T' x embd_dim ]
         x_pad = torch.cat([x, padding], dim=1)
         ## [ (B * T' / transition_dim) x transition_dim x embd_dim ]
-        x_pad = x_pad.view(-1, self.transition_dim, self.embd_dim)
+        x_pad = x_pad.view(-1, self.total_trans_dim, self.embd_dim)
         if verify:
             self.verify(x, x_pad)
         return x_pad, n_pad
 
     def verify(self, x, x_pad):
         b, t, embedding_dim = x.shape
-        n_states = int(np.ceil(t / self.transition_dim))
-        inds = torch.arange(0, self.transition_dim).repeat(n_states)[:t]
-        for i in range(self.transition_dim):
+        n_states = int(np.ceil(t / self.total_trans_dim))
+        inds = torch.arange(0, self.total_trans_dim).repeat(n_states)[:t]
+        for i in range(self.total_trans_dim):
             x_ = x[:,inds == i]
             t_ = x_.shape[1]
             x_pad_ = x_pad[:,i].view(b, n_states, embedding_dim)[:,:t_]
             print(i, x_.shape, x_pad_.shape)
             assert (x_ == x_pad_).all()
 
-    def forward(self, graph): # target mask
+    def forward(self, x, y, target=False):
         """
-            x : ( B * S, N_node, F )
-            y : ( B * S, arV_dim )
+            x : ( B, S, N_node, F )
+            y : ( B, S, arV_dim )
+            S : subsample * step
         """
-
-        b = graph.num_graphs # batch size
-        s = graph.num_nodes // b # subsampe * step
-        n, f = graph.x.shape[-2:]
+        b, s, n, f = x.size()
         assert s <= self.block_size, "Cannot forward, model block size is exhausted."
 
-        # (B*S, (N + 1)*F , n_embd), (B, nH, N+1, N+1)
-        #  512 * 10, 40, 128 / 5120, 4, 8, 8
-        state_embd, graph_attn_bias = self.grp_encoder(graph) # graph node feature
+        offset_x = self.state_offset(x.view(b*s, n, f))
+        # (BS, (N+1)*F, n_embd), (nH, N+1, N+1)
+        state_embd, graph_attn_bias = self.grp_encoder(offset_x)
 
-        y = graph.y
-        offset_start = self.node_feature_dim * self.vocab_size
-        offset_y = self.offset_tokens(y, s=offset_start)
-        # ( B * S, arV_dim, N_embd )
+        offset_y = self.arV_offset(y.view(b*s, -1))
+        # (BS, arV_dim, n_embd)
         arV_embd = self.tok_emb(offset_y)
-        # ( B, S * N_node * F, N_embd)
-        state_embd = state_embd.view(b, s * (n + 1) * f, self.embd_dim)
-        # ( B, S * arV_dim, N_embd ) 
-        arV_embd = arV_embd.view(b, s * y.shape[-1], self.embd_dim)
-        arV_embd = arV_embd[:, :-1, :] # for causal x :-1  target 1:
 
-        # ( B, S * (N_node*F + arV_dim) - 1, N_embd )
+        state_embd = state_embd.view(b, -1, self.embd_dim)
+        arV_embd = arV_embd.view(b, -1, self.embd_dim)
         token_embeddings = torch.cat([state_embd, arV_embd], dim=1)
-        t = token_embeddings.shape[1] # t = S * (N_node + arV_dim) 
-        position_embeddings = self.pos_emb[:, :t, :] # each position maps to a (learnable) vector
+
+        t = token_embeddings.size(1) # t = S * (N_node + arV_dim) 
+        position_embeddings = self.pos_emb[:, :t, :]
         x = self.drop(token_embeddings + position_embeddings)
 
         for block in self.blocks:
-            # x = block(x, attn_bias=graph_attn_bias)
-            x = block(x)
+            x = block(x, attn_bias=graph_attn_bias)
+            # x = block(x)
         x = self.ln_f(x)
 
         # S' : n_pad * S
-        # trans_dim : num_node*F + arV_dim
-        # ( B*S', trans_dim, N_embd )
+        # ( B*S', total_dim, N_embd )
         x_pad, n_pad = self.pad_to_full_observation(x)
-        # ( B*S', trans_dim, vocab_size + 1 )
+        # ( B*S', total_dim, vocab_size + 1 )
         logits = self.head(x_pad)
-        # ( B, S'*trans_dim, vocab_size + 1 )
+        # ( B, S' * total_dim, vocab_size + 1 )
         logits = logits.reshape(b, t + n_pad, self.vocab_size + 1)
-        # ( B, S'*trans_dim - 1, vocab_size + 1 ) 512, 159, 101
+        # ( B, S' * total_dim - 1, vocab_size + 1 ) 512, 159, 101
         logits = logits[:,:t]
 
-        x = graph.x.view(b*s, n*f)
-        x = torch.cat([x, torch.zeros((b*s, f), device=x.device)], dim=-1) # for virtual
-        targets = torch.cat([x, graph.y], dim=-1).long()
-        targets = targets.contiguous().view(b, -1)
-        targets = targets[:, 1:]
-        del graph
-
-        # logit 512, 479, 101
-        # target 512, 479
-        if targets is not None:
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.contiguous().view(-1), reduction='none')
+        # logit 256, 470, 101
+        # target 2560, 47
+        if target is not None:
+            y_hat = logits.reshape(-1, logits.size(-1))
+            y_true = target.contiguous().view(-1)
+            loss = F.cross_entropy(y_hat, y_true, reduction='none')
             if self.action_weight != 1 or self.reward_weight != 1 or self.value_weight != 1:
                 #### make weights
-                n_states = int(np.ceil(t / self.transition_dim))
+                n_states = int(np.ceil(t / self.total_trans_dim))
                 weights = torch.cat([
                     torch.ones((n+1) * f, device=x.device),
                     torch.ones(self.action_dim, device=x.device) * self.action_weight,
@@ -328,12 +329,12 @@ class GPT(nn.Module):
                     torch.ones(1, device=x.device) * self.value_weight,
                 ])
                 ## [ t + 1]
-                weights = weights.repeat(n_states)
+                weights = weights[1:].repeat(n_states)
                 ## [ b x t ]
-                weights = weights[1:].repeat(b, 1)
+                weights = weights.repeat(b, 1)
                 loss = loss * weights.view(-1)
             # loss = (loss * mask.view(-1)).mean()
         else:
             loss = None
 
-        return logits, loss, targets
+        return logits, loss

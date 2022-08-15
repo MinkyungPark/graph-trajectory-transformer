@@ -1,7 +1,9 @@
 import os
+import dill
 import json
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import defaultdict, namedtuple
+from tqdm import tqdm
 
 import gym
 import numpy as np
@@ -129,6 +131,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         if penalty is not None:
             terminal_mask = realterminals.squeeze()
             self.rewards_raw[terminal_mask] = penalty
+            self.termination_penalty = penalty
 
         ## segment
         print(f'[ datasets/sequence ] Segmenting...', end=' ', flush=True)
@@ -180,52 +183,32 @@ class SequenceDataset(torch.utils.data.Dataset):
 
 
 # ---------------- Graph Dataset ---------------- #
-def convert_to_single_emb(x, feature_num, offset=100, s=0):
-    feature_offset = torch.arange(s, feature_num * offset, offset, dtype=torch.long)
-    x = x + feature_offset
-    return x
 
-
-def preprocess_item(item):
+def preprocess_item(item, num_virtual_tokens=1):
     '''
-    x : (seq_len/step, n_node, feature_dim)
+    x : (trans_len, n_node, feature_dim)
     edge_index : (2, num_edge)
     '''
-    num_virtual_tokens = 1
-    # edge_attr, edge_index, x = item.edge_attr, item.edge_index, item.x
+    N, F = item.x.size()[-2:]
+    num_virtual_tokens = num_virtual_tokens
+    edge_index = item.edge_index
+    edge_attr = torch.zeros((edge_index.shape[1]), dtype=torch.long)[:, None] # (num_edge, 1)
 
-    # if edge_attr is None:
-    #     edge_attr = torch.zeros((edge_index.shape[1]), dtype=torch.long)
-    edge_index, x = item.edge_index[0], item.x
-    edge_attr = torch.zeros((edge_index.shape[1]), dtype=torch.long)
-
-    S = x.size(0)
-    N = x.size(1)
-    F = x.size(2)
-
-    # x = convert_to_single_emb(x, F)
-
-    # node adj matrix [N, N] bool
     adj_orig = torch.zeros([N, N], dtype=torch.bool)
     adj_orig[edge_index[0, :], edge_index[1, :]] = True
 
-    # edge feature here
-
-    if len(edge_attr.size()) == 1:
-        edge_attr = edge_attr[:, None]
     attn_edge_type = torch.zeros([N, N, edge_attr.size(-1)], dtype=torch.long)
     attn_edge_type[edge_index[0, :], edge_index[1, :]] = (
-        convert_to_single_emb(edge_attr, 1) + 1
-    )  # [n_nodes, n_nodes, 1]
+        edge_attr + 1
+    )  # (n_nodes, n_nodes, 1) if connect 1 else 0
 
     shortest_path_result, path = algos.floyd_warshall(
         adj_orig.numpy()
     )  # [n_nodesxn_nodes, n_nodesxn_nodes]
     max_dist = np.amax(shortest_path_result)
     
-    # (N, N, 510, 1)
     edge_input = algos.gen_edge_input(max_dist, path, attn_edge_type.numpy())
-    rel_pos = torch.from_numpy((shortest_path_result)).long()
+    rel_pos = torch.from_numpy((shortest_path_result)).long() 
     attn_bias = torch.zeros(
         [N + num_virtual_tokens, N + num_virtual_tokens], dtype=torch.float
     )  # with graph token
@@ -241,28 +224,27 @@ def preprocess_item(item):
 
     # for i in range(N + num_virtual_tokens):
     #     for j in range(N + num_virtual_tokens):
-
     #         val = True if random.random() < 0.3 else False
     #         adj[i, j] = adj[i, j] or val
 
-    # combine
-    item.x = x
-    item.adj = adj.repeat(S, 1, 1)
-    item.attn_bias = attn_bias.repeat(S, 1, 1)
-    item.attn_edge_type = attn_edge_type.repeat(S, 1, 1, 1)
-    item.rel_pos = rel_pos.repeat(S, 1, 1)
-    item.in_degree = adj_orig.long().sum(dim=1).view(-1).repeat(S, 1)
-    item.out_degree = adj_orig.long().sum(dim=0).view(-1).repeat(S, 1)
-    item.edge_input = torch.from_numpy(edge_input).long().repeat(S, 1, 1, 1, 1)
+    item.adj = adj # (N+1, N+1) the last node is virtual node which is connected to all nodes
+    item.attn_bias = attn_bias # (N+1, N+1) zeros
+    item.attn_edge_type = attn_edge_type # (N, N, 1) if connect 1 else 0
+    item.rel_pos = rel_pos # (N, N) shortest distance, unreachable 100
+    item.in_degree = adj_orig.long().sum(dim=1).view(-1) # (,N)
+    item.out_degree = adj_orig.long().sum(dim=0).view(-1) # (,N)
+    item.edge_input = torch.from_numpy(edge_input).long() # # (N, N, 100(unreachable distance), 1)
 
     return item
 
 
 class MujocoGraphDataset(SequenceDataset):
 
-    def __init__(self, N=100, *args, **kwargs):
+    def __init__(self, N=100, cached_data_name=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.d_path = self.dataset.split('-')[0]
+        self.vocab_size = N # vocab size
+        self.num_virtual_tokens = 1
         
         state_space_path = open(os.path.join('asserts', 'state_space.json'))
         state_space = json.load(state_space_path)
@@ -271,14 +253,29 @@ class MujocoGraphDataset(SequenceDataset):
         xml_path = os.path.join('asserts', self.d_path + '.xml')
         tree = ET.parse(xml_path)
         root = tree.getroot()
-
         self.world_body = root.find('worldbody')
         self.actuator = root.find('actuator')
-        self.num_node = self._get_num_node()
-        self.N = N
-        self.discretizer = QuantileDiscretizer(self.joined_raw, N)
+        self.discretizer = QuantileDiscretizer(self.joined_raw, self.vocab_size)
 
-    def _set_node_dict(self):
+        self.cached_data_name = cached_data_name
+        self.graph_dataset = self._get_graph_dataset()
+        self.num_node, self.node_feature_dim = self.graph_dataset.x.size()[-2:]
+        self._save_dataset()
+
+    def _get_graph_dataset(self):
+        # joined_segmneted (1000, 1009, 25) 
+        # 1000 episode, each epi padded transitions(seq_len), each trans dim 25
+        num_epi, len_seq, trans_dim = self.joined_segmented.shape
+        print('[ discretization ] All dataset discretizing...')
+        joined_discrete = [self.discretizer.discretize(epi) for epi in tqdm(self.joined_segmented)]
+        joined_discrete = torch.tensor(joined_discrete, device='cpu', dtype=torch.long).contiguous()
+        joined_discrete[self.termination_flags] = self.vocab_size
+
+        # ----- for states to graph ----- # 
+        all_observations = joined_discrete[:, :, :self.s_dim]
+        all_observations = all_observations.view(num_epi * len_seq, self.s_dim)
+
+        # graph data structure
         node_dict = defaultdict(dict)
         i = 0
         for child in self.world_body.iter():
@@ -291,80 +288,102 @@ class MujocoGraphDataset(SequenceDataset):
                     'node_features': []
                     }
                 i += 1
-        return node_dict
+        num_node = len(node_dict.keys())
 
-    def _get_num_node(self):
-        node_dict = self._set_node_dict()
-        return len(node_dict.keys())
-
-    def get_discretizer(self):
-        return self.discretizer
-
-    def get_node_features(self, sample):
-        sample_node_dict = self._set_node_dict()
-        for state_name, value in zip(self.state_space, sample):
-            for body, v in sample_node_dict.items():
-                if state_name in v['joint']:
+        # all_observations (num_epi * len_seq, obs_dim)
+        for state_name, each_axis_obs in zip(self.state_space, all_observations.transpose(1, 0)):
+            for body, node_values in node_dict.items():
+                if state_name in node_values['joint']:
                     node = body
-            sample_node_dict[node]['node_features'].append(value)
+            # (node_feature_dim, num_epi * len_seq)
+            node_dict[node]['node_features'].append(each_axis_obs.tolist())
+            
+        
+        max_feature_dim = max([len(v['node_features']) for v in node_dict.values()])
+        node_features = np.zeros((num_epi * len_seq, num_node, max_feature_dim))
 
-        max_feature_len = max([len(v['node_features']) for v in sample_node_dict.values()])
-        node_features = np.zeros((self.num_node, max_feature_len))
-
-        # make graph data
         e_start, e_end = [], []
-        for body, v in sample_node_dict.items():
-            n_i = v['index']
-            n_adj = len([v['direction']])
+        for body, node_values in node_dict.items():
+            # edge sindex
+            n_i = node_values['index']
+            n_adj = len([node_values['direction']])
             if n_adj > 0:
-                for adj in v['direction']:
+                for adj in node_values['direction']:
                     e_start.append(n_i)
-                    e_end.append(sample_node_dict[adj]['index'])
-            n_features = v['node_features']
-            node_features[n_i, :len(n_features)] = n_features
+                    e_end.append(node_dict[adj]['index'])
+            
+            features = torch.tensor(node_values['node_features'], dtype=torch.long)
+            # node feature (total_transition, num_node, node_feature_dim)
+            node_features[:, n_i, :features.size(0)] = features.transpose(1, 0)
 
-        return e_start, e_end, node_features
-
-
-    def __getitem__(self, idx):
-        path_ind, start_ind, end_ind = self.indices[idx]
-        # joined_segmented (1000, 1009, 25) 1000개 에피소드, 각 에피소드 transitions(seq_len) 1009로 패딩, 각 transition 25
-        joined = self.joined_segmented[path_ind, start_ind:end_ind:self.step]
-        terminations = self.termination_flags[path_ind, start_ind:end_ind:self.step]
-        joined_discrete = self.discretizer.discretize(joined)
+        x = torch.from_numpy(node_features).long()
+        y = joined_discrete[:, :, self.s_dim:].view(num_epi * len_seq, -1)
+        edge_index = torch.tensor([e_start, e_end], dtype=torch.long)
         
-        ## replace with termination token if the sequence has ended
-        assert (joined[terminations] == 0).all(), \
-                f'Everything after termination should be 0: {path_ind} | {start_ind} | {end_ind}'
-        
-        joined_discrete[terminations] = self.N
-        joined_discrete = torch.tensor(joined_discrete, device='cpu', dtype=torch.long).contiguous()
-
-        # ----- for states ----- # 
-        edege_starts, edege_ends, n_features = [], [], []
-        for sample in joined_discrete[:, :self.s_dim]:
-            st_node, end_node, n_feature = self.get_node_features(sample)
-            edege_starts.append(st_node)
-            edege_ends.append(end_node)
-            n_features.append(n_feature)
-
-        # (seq_len/steps X n_nodes X each_node_feature_dim)
-        node_features = np.stack(n_features)
-        x_s = np.array([node_feature for node_feature in node_features])
-        batch_x = torch.from_numpy(x_s).long()
-        batch_edge_index = torch.tensor([[e_s, e_e] for e_s, e_e in zip(edege_starts, edege_ends)], dtype=torch.long)
-
-        data_graphs = Data(x=batch_x, edge_index=batch_edge_index, y=joined_discrete[:, self.s_dim:])
-        data_graphs = preprocess_item(data_graphs)
+        x = x.view(num_epi, len_seq, num_node, max_feature_dim)
+        y = y.view(num_epi, len_seq, -1)
+        data_graphs = Data(x=x, edge_index=edge_index, y=y)
+        data_graphs = preprocess_item(data_graphs, self.num_virtual_tokens)
 
         return data_graphs
 
+    def _save_dataset(self):
+        save_data = {
+            "discretizer" : self.discretizer,
+            "termination_penalty" : self.termination_penalty,
+            "discount" : self.discount,
+            "sequence_length" : self.sequence_length,
+            "step" : self.step,
+            "max_path_length": self.max_path_length,
+            "indices" : self.indices,
+            "joined_dim" : self.joined_dim,
+            "s_dim" : self.s_dim,
+            "a_dim" : self.a_dim,
+            "vocab_size" : self.vocab_size,
+            "num_node" : self.num_node, 
+            "node_feature_dim" : self.node_feature_dim,
+            "num_virtual_tokens" : self.num_virtual_tokens,
+            "graph_dataset" : self.graph_dataset
+        }
 
-def test():
-    dataset = MujocoGraphDataset(
-        env='halfcheetah-medium-v2',
-        sequence_length=1,
-    )
-    sample = dataset.__getitem__(0)
+        with open('./asserts/' + self.cached_data_name, 'wb') as f:
+            dill.dump(save_data, f)
+        print(f'## Cached Dataset Saved /asserts/{self.cached_data_name}...')
 
-# test()
+
+class GraphDataset(torch.utils.data.Dataset):
+    def __init__(self, cached_dataset):
+        super().__init__()
+        for k, v in cached_dataset.items():
+            setattr(self, k, v)
+
+    def get_graph_attr(self, device='cpu'):
+        GraphAttr = namedtuple('GraphAttr', 'adj attn_bias attn_edge_type rel_pos in_degree out_degree edge_input')
+        graph_attr = GraphAttr(
+                            self.graph_dataset.adj.to(device),
+                            self.graph_dataset.attn_bias.to(device),
+                            self.graph_dataset.attn_edge_type.to(device),
+                            self.graph_dataset.rel_pos.to(device),
+                            self.graph_dataset.in_degree.to(device),
+                            self.graph_dataset.out_degree.to(device),
+                            self.graph_dataset.edge_input.to(device),
+                    )
+        return graph_attr
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        path_ind, start_ind, end_ind = self.indices[idx] # epi_num, start_timestep, end_timestep
+        x = self.graph_dataset.x[path_ind, start_ind:end_ind:self.step] # 10, 7, 5
+        y = self.graph_dataset.y[path_ind, start_ind:end_ind:self.step] # 10, 8
+
+        # make target
+        s, n, f = x.size()
+        padded_x = torch.cat([x.view(s, n*f), torch.zeros(s, f)], dim=-1)
+        target = torch.cat([padded_x, y], dim=-1)
+        target = target.long().view(s, -1)
+        target = target[:, 1:]
+        y = y[:, :-1]
+
+        return x, y, target

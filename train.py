@@ -9,7 +9,7 @@ import torch
 
 from gpt import GPT, GPTConfig
 from trainer import Trainer
-from dataset import MujocoGraphDataset
+from dataset import MujocoGraphDataset, GraphDataset
 from utils import set_seed, check_dir, Timer
 
 parser = argparse.ArgumentParser()
@@ -49,31 +49,42 @@ set_seed(args.seed)
 savepath = check_dir(os.path.join('logs', args.dataset, f'base_{args.seed}'))
 
 
-################# Dataset #################
+# -------------------- Dataset -------------------- #
+cached_data_name = f'{args.dataset}_graph_dataset.dill'
+if cached_data_name not in os.listdir('./asserts'):
+    sequence_length = args.subsampled_sequence_length * args.step
+    MujocoGraphDataset(
+        dataset=args.dataset,
+        N=args.N,
+        penalty=args.termination_penalty,
+        sequence_length=sequence_length,
+        step=args.step,
+        discount=args.discount,
+        max_path_length=args.max_path_length,
+        cached_data_name=cached_data_name
+    )
+with open('./asserts/' + cached_data_name, 'rb') as f:
+    cached_dataset = dill.load(f)
 
-sequence_length = args.subsampled_sequence_length * args.step
+dataset = GraphDataset(cached_dataset)
+graph_attr = dataset.get_graph_attr(args.device)
 
-dataset = MujocoGraphDataset(
-    dataset=args.dataset,
-    N=args.N,
-    penalty=args.termination_penalty,
-    sequence_length=sequence_length,
-    step=args.step,
-    discount=args.discount,
-    max_path_length=args.max_path_length,
-)
-# save discretizer
-torch.save(dataset.get_discretizer(), os.path.join(savepath, "discretizer.pt"))
+# -------------------- GPT Model -------------------- #
+node_feature_dim = dataset.node_feature_dim
+num_node = dataset.num_node
+num_virtual_tokens = dataset.num_virtual_tokens
+joined_dim = dataset.joined_dim
+state_dim = dataset.s_dim
+action_dim = dataset.a_dim
+vocab_size = dataset.vocab_size
 
-################# Model GPT #################
-num_virtual_token=1
-num_node = 7
-node_feature_dim = 5
+state_feat_dim = (num_node + num_virtual_tokens) * node_feature_dim
+arV_dim = joined_dim - state_dim
+total_dim = state_feat_dim + arV_dim # per transition
+block_size = args.subsampled_sequence_length * total_dim - 1
 
-trans_dim = (dataset.joined_dim - dataset.s_dim) + (num_node + num_virtual_token)*node_feature_dim
-block_size = args.subsampled_sequence_length * trans_dim - 1
 mconf = GPTConfig(
-    vocab_size=args.N, 
+    vocab_size=vocab_size, 
     n_layer=args.n_layer, 
     n_head=args.n_head, 
     n_embd=args.n_embd * args.n_head,
@@ -84,24 +95,23 @@ mconf = GPTConfig(
     resid_pdrop=args.resid_pdrop, 
     attn_pdrop=args.attn_pdrop,
     block_size=block_size, 
-    obs_dim=dataset.s_dim, 
-    action_dim=dataset.a_dim, 
-    trans_dim=trans_dim,
-    discount=dataset.discount,
+    total_dim=total_dim,
+    action_dim=action_dim,
+    arV_dim=arV_dim,
     # for graphormerEncoder
-    num_virtual_token=num_virtual_token,
+    num_virtual_tokens=num_virtual_tokens,
     num_node=num_node,
     node_feature_dim=node_feature_dim,
+    graph_attr=graph_attr
     )
-
 
 model = GPT(config=mconf)
 mconf.seed = args.seed
 dill.dump(mconf, open(savepath + '/model_config.dill', 'wb'))
 model.to(args.device)
 
-################# Trainer #################
 
+# -------------------- Traniner -------------------- #
 warmup_tokens = len(dataset) * block_size ## number of tokens seen per epoch
 final_tokens = 20 * warmup_tokens
 
@@ -121,8 +131,8 @@ trainer = Trainer(
 n_epochs = int(1e6 / len(dataset) * args.n_epochs_ref)
 save_freq = int(n_epochs // args.n_saves)
 
-################# Training ! #################
 
+# -------------------- Training ! -------------------- #
 timer, tr_stt = Timer(), datetime.datetime.now()
 for epoch in range(n_epochs):
     print(f'\nEpoch: {epoch} / {n_epochs} | {args.dataset} ')
