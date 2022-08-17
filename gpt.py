@@ -273,34 +273,69 @@ class GPT(nn.Module):
             print(i, x_.shape, x_pad_.shape)
             assert (x_ == x_pad_).all()
 
-    def forward(self, x, y, target=False):
+    def forward(self, x, y, target=None, sampled=None, dim=0):
         """
             x : ( B, S, N_node, F )
             y : ( B, S, arV_dim )
             S : subsample * step
         """
+        
+        # -------------------- wrapping for planning -------------------- #
+        if sampled is not None:
+            sampled_x, sampled_y, sample_type = sampled
+            if sample_type == 'observation' and dim > 0:
+                b, s, n, f = x.size()
+                x = torch.concat([x, sampled_x.view(b, -1, n, f)], dim=1)
+                dim = sampled_x.size(-1) + (self.num_virtual_tokens*self.node_feature_dim) - dim
+            if sample_type == 'action' and dim > 0: # b, 1, d
+                y = sampled_y if y.size(-1) == 0 else torch.concat([y, sampled_y], dim=1)
+                dim = sampled_y.size(-1) - dim
+            if sample_type == 'reward':
+                if dim > 0:
+                    y[:, -1:, -sampled_y.size(-1):] = sampled_y
+                dim = sampled_y.size(-1) - dim
+        # ---------------------------------------------------------------- #
+        
         b, s, n, f = x.size()
+        _, y_s, y_d = y.size() # b, s, d
         assert s <= self.block_size, "Cannot forward, model block size is exhausted."
 
         offset_x = self.state_offset(x.view(b*s, n, f))
         # (BS, (N+1)*F, n_embd), (nH, N+1, N+1)
         state_embd, graph_attn_bias = self.grp_encoder(offset_x)
 
-        offset_y = self.arV_offset(y.view(b*s, -1))
+        offset_y = self.arV_offset(y.view(b*y_s, y_d))
         # (BS, arV_dim, n_embd)
         arV_embd = self.tok_emb(offset_y)
 
-        state_embd = state_embd.view(b, -1, self.embd_dim)
-        arV_embd = arV_embd.view(b, -1, self.embd_dim)
-        token_embeddings = torch.cat([state_embd, arV_embd], dim=1)
+        arV_embd = arV_embd.view(b, y_s, y_d, self.embd_dim)
+        state_embd = state_embd.view(b, s, -1, self.embd_dim)
 
-        t = token_embeddings.size(1) # t = S * (N_node + arV_dim) 
+        if s > y_s:
+            token_embeddings = torch.cat([state_embd[:, :-1, :, :], arV_embd], dim=2)
+            token_embeddings = token_embeddings.view(b, -1, self.embd_dim)
+            last_state_embd = state_embd[:, -1, :, :].view(b, -1, self.embd_dim)
+            token_embeddings = torch.cat([token_embeddings, last_state_embd], dim=1)
+        elif s < y_s:
+            token_embeddings = torch.cat([state_embd, arV_embd[:, :-1, :, :]], dim=2)
+            token_embeddings = token_embeddings.view(b, -1, self.embd_dim)
+            last_act_embd = arV_embd[:, -1, :, :].view(b, -1, self.embd_dim)
+            token_embeddings = torch.cat([token_embeddings, last_act_embd], dim=1)
+        else:
+            token_embeddings = torch.cat([state_embd, arV_embd], dim=2)
+            token_embeddings = token_embeddings.view(b, -1, self.embd_dim)
+
+
+        if dim > 0:
+            token_embeddings = token_embeddings[:, :-dim, :]
+
+        # b, t, n_emb
+        t = token_embeddings.size(1) # t = S * (N_node + arV_dim)
         position_embeddings = self.pos_emb[:, :t, :]
         x = self.drop(token_embeddings + position_embeddings)
 
         for block in self.blocks:
             x = block(x, attn_bias=graph_attn_bias)
-            # x = block(x)
         x = self.ln_f(x)
 
         # S' : n_pad * S

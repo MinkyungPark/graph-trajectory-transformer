@@ -14,7 +14,7 @@ from utils import set_seed, check_dir, Timer
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument('--dataset', type=str, default='halfcheetah-medium-v2')
+parser.add_argument('--dataset', type=str, default='walker2d-medium-expert-v2')
 parser.add_argument('--max_path_length', type=int, default=1000)
 parser.add_argument('--N', type=int, default=100)
 parser.add_argument('--discount', type=float, default=0.99)
@@ -46,7 +46,7 @@ parser.add_argument('--value_weight', type=int, default=1)
 
 args = parser.parse_args()
 set_seed(args.seed)
-savepath = check_dir(os.path.join('logs', args.dataset, f'base_{args.seed}'))
+save_path = check_dir(os.path.join('logs', args.dataset, f'base_{args.seed}'))
 
 
 # -------------------- Dataset -------------------- #
@@ -107,9 +107,8 @@ mconf = GPTConfig(
 
 model = GPT(config=mconf)
 mconf.seed = args.seed
-dill.dump(mconf, open(savepath + '/model_config.dill', 'wb'))
 model.to(args.device)
-
+dill.dump(mconf, open(save_path + '/model_config.dill', 'wb'))
 
 # -------------------- Traniner -------------------- #
 warmup_tokens = len(dataset) * block_size ## number of tokens seen per epoch
@@ -134,6 +133,7 @@ save_freq = int(n_epochs // args.n_saves)
 
 # -------------------- Training ! -------------------- #
 timer, tr_stt = Timer(), datetime.datetime.now()
+model_path = check_dir(os.path.join(save_path, 'models'))
 for epoch in range(n_epochs):
     print(f'\nEpoch: {epoch} / {n_epochs} | {args.dataset} ')
     trainer.train(model, dataset)
@@ -141,10 +141,10 @@ for epoch in range(n_epochs):
     torch.cuda.empty_cache()
     
     # save_epoch = (epoch + 1) // save_freq * save_freq
-    statepath = os.path.join(savepath, f'state_{epoch}.pt')
+    state_path = os.path.join(model_path, f'state_{epoch}.pt')
     state = model.state_dict()
-    torch.save(state, statepath)
-    print(f'Saving model to {statepath}')
+    torch.save(state, state_path)
+    print(f'Saving model to {state_path}')
 
 
 time_log = f'{args.dataset} : training start-time: {tr_stt} | training end-time : {datetime.datetime.now()} | timer: {timer():.2f} \n'
@@ -152,4 +152,4 @@ with open('./logs/time_log.txt', 'a') as f:
     f.write(time_log)
 
 # argument save
-json.dump(vars(args), open(savepath + '/args_info.json', 'w'), indent=2, sort_keys=True)
+json.dump(vars(args), open(save_path + '/args_info.json', 'w'), indent=2, sort_keys=True)

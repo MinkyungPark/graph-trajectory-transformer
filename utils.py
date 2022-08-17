@@ -17,15 +17,13 @@ def set_seed(seed, env=None):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-DTYPE = torch.float
-# DEVICE = 'cuda:3'
-DEVICE = torch.cuda.current_device()
-
 def to_np(x):
 	if torch.is_tensor(x):
 		x = x.detach().cpu().numpy()
 	return x
 
+DTYPE = torch.float
+DEVICE = torch.cuda.current_device()
 def to_torch(x, dtype=None, device=None):
 	dtype = dtype or DTYPE
 	device = device or DEVICE

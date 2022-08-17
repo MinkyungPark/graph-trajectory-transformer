@@ -3,8 +3,7 @@ import torch
 
 from utils import to_np, to_torch
 
-######################################################## Segment
-
+# -------------------- Segment -------------------- #
 def segment(observations, terminals, max_path_length):
     """
         segment `observations` into trajectories according to `terminals`
@@ -38,8 +37,7 @@ def segment(observations, terminals, max_path_length):
     return trajectories_pad, early_termination, path_lengths
 
 
-######################################################## Discretization
-
+# -------------------- Discretization -------------------- #
 class QuantileDiscretizer:
 	def __init__(self, data, N):
 		self.data = data
@@ -136,8 +134,7 @@ class QuantileDiscretizer:
 		recon = (left + right) / 2.
 		return recon
 
-	#---------------------------- wrappers for planning ----------------------------#
-
+	# -------------------- wrappers for planning -------------------- #
 	def expectation(self, probs, subslice):
 		'''
 			probs : [ B x N ]
@@ -172,8 +169,6 @@ class QuantileDiscretizer:
 		right = thresholds[inds]
 		avg = (left + right) / 2.
 		return avg
-
-	#---------------------------- wrappers for planning ----------------------------#
 
 	def value_expectation(self, probs):
 		'''
